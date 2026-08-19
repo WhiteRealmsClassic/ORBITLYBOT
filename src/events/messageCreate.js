@@ -4,12 +4,28 @@ import { getLevelingConfig, getUserLevelData } from '../services/leveling/leveli
 import { addXp } from '../services/leveling/xpSystem.js';
 import { checkRateLimit } from '../utils/rateLimiter.js';
 import { parsePrefixCommand } from '../utils/prefixParser.js';
-import { supportsPrefixExecution, executePrefixCommand, resolvePrefixAccessKey } from '../utils/messageAdapter.js';
-import { resolveCommandAlias, resolveSubcommandAlias } from '../config/commands/commandAliases.js';
+import {
+  supportsPrefixExecution,
+  executePrefixCommand,
+  resolvePrefixAccessKey
+} from '../utils/messageAdapter.js';
+import {
+  resolveCommandAlias,
+  resolveSubcommandAlias
+} from '../config/commands/commandAliases.js';
 import { getPrefixRestriction } from '../config/commands/prefixRestrictions.js';
 import { getGuildConfig } from '../services/config/guildConfig.js';
-import { getCommandPrefix, getBotMessage, isBotOwner, isCommandCategoryEnabled, isMaintenanceMode } from '../config/bot.js';
-import { enforceAbuseProtection, formatCooldownDuration } from '../utils/abuseProtection.js';
+import {
+  getCommandPrefix,
+  getBotMessage,
+  isBotOwner,
+  isCommandCategoryEnabled,
+  isMaintenanceMode
+} from '../config/bot.js';
+import {
+  enforceAbuseProtection,
+  formatCooldownDuration
+} from '../utils/abuseProtection.js';
 import { createEmbed } from '../utils/embeds.js';
 import { isCommandEnabled } from '../services/commandAccessService.js';
 import {
@@ -18,6 +34,10 @@ import {
   isValidCountingMessage,
   recordCorrectCount,
 } from '../services/countingGameService.js';
+
+// IMPORTANT:
+// Change this import path ONLY if your GroqService exports the DM function
+// under a different name.
 import { askGroq } from '../services/GroqService.js';
 
 const MESSAGE_XP_RATE_LIMIT_ATTEMPTS = 12;
@@ -28,20 +48,30 @@ export default {
 
   async execute(message, client) {
     try {
-      // Ignore messages sent by bots
-      if (message.author.bot) return;
+      // Ignore other bots.
+      if (message.author.bot) {
+        return;
+      }
 
-      // =========================
-      // GROQ AI DM HANDLER
-      // =========================
+      /*
+       * ============================
+       * DIRECT MESSAGES
+       * ============================
+       *
+       * DMs have message.guild === null.
+       * Handle them BEFORE any guild-only code.
+       */
+
       if (!message.guild) {
         await handleDM(message);
         return;
       }
 
-      // =========================
-      // SERVER MESSAGE HANDLING
-      // =========================
+      /*
+       * ============================
+       * GUILD MESSAGES
+       * ============================
+       */
 
       logger.debug(
         `Message received from ${message.author.tag}: ${message.content}`
@@ -63,11 +93,66 @@ export default {
   }
 };
 
+
+/**
+ * Handle direct messages with Groq.
+ */
+async function handleDM(message) {
+  try {
+    const content = message.content?.trim();
+
+    if (!content) {
+      return;
+    }
+
+    logger.info(
+      `DM received from ${message.author.tag}: ${content}`
+    );
+
+    await message.channel.sendTyping().catch(() => {});
+
+    const response = await askGroq(
+      message.author.id,
+      content
+    );
+
+    if (!response) {
+      await message.channel.send(
+        'Sorry, I could not generate a response right now.'
+      );
+
+      return;
+    }
+
+    await message.channel.send(response);
+
+  } catch (error) {
+    logger.error(
+      `Error handling DM from ${message.author.tag}:`,
+      error
+    );
+
+    await message.channel.send(
+      'I ran into an error while thinking. Try again in a moment.'
+    ).catch(() => {});
+  }
+}
+
+
 async function handlePrefixCommand(message, client) {
   try {
-    const guildConfig = await getGuildConfig(client, message.guild.id);
-    const prefix = guildConfig?.prefix || getCommandPrefix();
-    const parsed = parsePrefixCommand(message.content, prefix);
+    const guildConfig = await getGuildConfig(
+      client,
+      message.guild.id
+    );
+
+    const prefix =
+      guildConfig?.prefix || getCommandPrefix();
+
+    const parsed = parsePrefixCommand(
+      message.content,
+      prefix
+    );
 
     if (!parsed) {
       return;
@@ -75,7 +160,8 @@ async function handlePrefixCommand(message, client) {
 
     let { commandName, args } = parsed;
 
-    const musicPrefixShortcut = commandName.toLowerCase();
+    const musicPrefixShortcut =
+      commandName.toLowerCase();
 
     const MUSIC_PREFIX_SHORTCUTS = new Set([
       'leave',
@@ -86,22 +172,34 @@ async function handlePrefixCommand(message, client) {
       'volume'
     ]);
 
-    if (MUSIC_PREFIX_SHORTCUTS.has(musicPrefixShortcut)) {
+    if (
+      MUSIC_PREFIX_SHORTCUTS.has(
+        musicPrefixShortcut
+      )
+    ) {
       commandName = 'music';
-      args = [musicPrefixShortcut, ...args];
+
+      args = [
+        musicPrefixShortcut,
+        ...args
+      ];
     }
 
     logger.info(
       `Prefix command detected: ${commandName}, args: ${args.join(', ')}`
     );
 
-    const resolvedCommandName = resolveCommandAlias(commandName);
+    const resolvedCommandName =
+      resolveCommandAlias(commandName);
 
     logger.info(
       `Resolved command name: ${resolvedCommandName}`
     );
 
-    const command = client.commands.get(resolvedCommandName);
+    const command =
+      client.commands.get(
+        resolvedCommandName
+      );
 
     if (!command) {
       logger.warn(
@@ -119,34 +217,41 @@ async function handlePrefixCommand(message, client) {
         embeds: [
           createEmbed({
             title: 'Maintenance Mode',
-            description: getBotMessage('maintenanceMode'),
+            description:
+              getBotMessage('maintenanceMode'),
             color: 'warning',
-          }),
+          })
         ],
       }).catch(() => {});
 
       return;
     }
 
-    if (!isCommandCategoryEnabled(command.category)) {
+    if (
+      !isCommandCategoryEnabled(
+        command.category
+      )
+    ) {
       await message.channel.send({
         embeds: [
           createEmbed({
             title: 'Feature Disabled',
-            description: getBotMessage('commandDisabled'),
+            description:
+              getBotMessage('commandDisabled'),
             color: 'error',
-          }),
+          })
         ],
       }).catch(() => {});
 
       return;
     }
 
-    const restriction = getPrefixRestriction(
-      command,
-      args,
-      resolveSubcommandAlias
-    );
+    const restriction =
+      getPrefixRestriction(
+        command,
+        args,
+        resolveSubcommandAlias
+      );
 
     if (
       !supportsPrefixExecution(command) ||
@@ -163,9 +268,9 @@ async function handlePrefixCommand(message, client) {
           color: 'info',
         });
 
-        await message.channel
-          .send({ embeds: [embed] })
-          .catch(() => {});
+        await message.channel.send({
+          embeds: [embed]
+        }).catch(() => {});
       }
 
       return;
@@ -175,7 +280,10 @@ async function handlePrefixCommand(message, client) {
       !(await isCommandEnabled(
         client,
         message.guild.id,
-        resolvePrefixAccessKey(command.data, args),
+        resolvePrefixAccessKey(
+          command.data,
+          args
+        ),
         command.category
       ))
     ) {
@@ -186,9 +294,9 @@ async function handlePrefixCommand(message, client) {
         color: 'error',
       });
 
-      await message.channel
-        .send({ embeds: [embed] })
-        .catch(() => {});
+      await message.channel.send({
+        embeds: [embed]
+      }).catch(() => {});
 
       return;
     }
@@ -218,9 +326,9 @@ async function handlePrefixCommand(message, client) {
         color: 'error',
       });
 
-      await message.channel
-        .send({ embeds: [embed] })
-        .catch(() => {});
+      await message.channel.send({
+        embeds: [embed]
+      }).catch(() => {});
 
       return;
     }
@@ -246,6 +354,7 @@ async function handlePrefixCommand(message, client) {
   }
 }
 
+
 async function handleCountingGame(message, client) {
   try {
     const config =
@@ -262,7 +371,8 @@ async function handleCountingGame(message, client) {
       return false;
     }
 
-    const content = message.content.trim();
+    const content =
+      message.content.trim();
 
     const validCount =
       isValidCountingMessage(
@@ -272,10 +382,12 @@ async function handleCountingGame(message, client) {
 
     const invalidAttempt =
       !validCount ||
-      message.author.id === config.lastUserId;
+      message.author.id ===
+        config.lastUserId;
 
     if (invalidAttempt) {
-      await message.delete().catch(() => {});
+      await message.delete()
+        .catch(() => {});
 
       await saveCountingGameConfig(
         client,
@@ -320,6 +432,7 @@ async function handleCountingGame(message, client) {
   }
 }
 
+
 async function handleLeveling(message, client) {
   try {
     const rateLimitKey =
@@ -347,9 +460,8 @@ async function handleLeveling(message, client) {
     }
 
     if (
-      levelingConfig.ignoredChannels?.includes(
-        message.channel.id
-      )
+      levelingConfig.ignoredChannels
+        ?.includes(message.channel.id)
     ) {
       return;
     }
@@ -366,9 +478,8 @@ async function handleLeveling(message, client) {
         member &&
         member.roles.cache.some(
           role =>
-            levelingConfig.ignoredRoles.includes(
-              role.id
-            )
+            levelingConfig.ignoredRoles
+              .includes(role.id)
         )
       ) {
         return;
@@ -376,9 +487,8 @@ async function handleLeveling(message, client) {
     }
 
     if (
-      levelingConfig.blacklistedUsers?.includes(
-        message.author.id
-      )
+      levelingConfig.blacklistedUsers
+        ?.includes(message.author.id)
     ) {
       return;
     }
@@ -403,7 +513,8 @@ async function handleLeveling(message, client) {
     const now = Date.now();
 
     const timeSinceLastMessage =
-      now - (userData.lastMessage || 0);
+      now -
+      (userData.lastMessage || 0);
 
     if (
       timeSinceLastMessage <
@@ -466,67 +577,5 @@ async function handleLeveling(message, client) {
       'Error handling leveling for message:',
       error
     );
-  }
-}
-
-/**
- * Handle direct messages with Groq AI.
- *
- * Each Discord user gets their own conversation.
- */
-async function handleDM(message) {
-  try {
-    if (!message.content?.trim()) {
-      return;
-    }
-
-    logger.info(
-      `DM received from ${message.author.tag}: ${message.content}`
-    );
-
-    // Show typing indicator
-    await message.channel.sendTyping();
-
-    // Send the user's Discord ID so GroqService
-    // can maintain a separate conversation for them.
-    const response = await askGroq(
-      message.author.id,
-      message.content
-    );
-
-    if (!response) {
-      await message.reply(
-        'I could not generate a response.'
-      );
-
-      return;
-    }
-
-    // Discord has a 2000 character message limit.
-    if (response.length <= 2000) {
-      await message.reply(response);
-      return;
-    }
-
-    // Split long responses into multiple messages.
-    for (
-      let i = 0;
-      i < response.length;
-      i += 2000
-    ) {
-      await message.channel.send(
-        response.slice(i, i + 2000)
-      );
-    }
-
-  } catch (error) {
-    logger.error(
-      'Error handling DM with Groq:',
-      error
-    );
-
-    await message.reply(
-      'Something went wrong while talking to my AI brain.'
-    ).catch(() => {});
   }
 }
