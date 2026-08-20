@@ -1,7 +1,7 @@
 const USER_API = "https://users.roblox.com/v1/usernames/users";
 const PRESENCE_API = "https://presence.roblox.com/v1/presence/users";
 
-async function getUserByUsername(username) {
+export async function getUserByUsername(username) {
     const response = await fetch(USER_API, {
         method: "POST",
         headers: {
@@ -14,7 +14,9 @@ async function getUserByUsername(username) {
     });
 
     if (!response.ok) {
-        throw new Error(`Roblox user lookup failed: ${response.status}`);
+        throw new Error(
+            `Roblox user lookup failed: ${response.status}`
+        );
     }
 
     const data = await response.json();
@@ -26,7 +28,7 @@ async function getUserByUsername(username) {
     return data.data[0];
 }
 
-async function getPresence(userId) {
+export async function getPresence(userId) {
     const response = await fetch(PRESENCE_API, {
         method: "POST",
         headers: {
@@ -38,7 +40,9 @@ async function getPresence(userId) {
     });
 
     if (!response.ok) {
-        throw new Error(`Roblox presence lookup failed: ${response.status}`);
+        throw new Error(
+            `Roblox presence lookup failed: ${response.status}`
+        );
     }
 
     const data = await response.json();
@@ -46,7 +50,7 @@ async function getPresence(userId) {
     return data.userPresences?.[0] ?? null;
 }
 
-async function getRobloxStatus(username) {
+export async function getRobloxStatus(username) {
     const user = await getUserByUsername(username);
 
     if (!user) {
@@ -64,9 +68,3 @@ async function getRobloxStatus(username) {
         presence
     };
 }
-
-module.exports = {
-    getUserByUsername,
-    getPresence,
-    getRobloxStatus
-};
