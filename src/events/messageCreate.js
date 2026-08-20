@@ -3,15 +3,21 @@ import { Events } from 'discord.js';
 import { logger } from '../utils/logger.js';
 
 import { getLevelingConfig, getUserLevelData } from '../services/leveling/leveling.js';
-
 import { addXp } from '../services/leveling/xpSystem.js';
 
 import { checkRateLimit } from '../utils/rateLimiter.js';
 import { parsePrefixCommand } from '../utils/prefixParser.js';
 
-import { supportsPrefixExecution, executePrefixCommand, resolvePrefixAccessKey } from '../utils/messageAdapter.js';
+import {
+    supportsPrefixExecution,
+    executePrefixCommand,
+    resolvePrefixAccessKey
+} from '../utils/messageAdapter.js';
 
-import { resolveCommandAlias, resolveSubcommandAlias } from '../config/commands/commandAliases.js';
+import {
+    resolveCommandAlias,
+    resolveSubcommandAlias
+} from '../config/commands/commandAliases.js';
 
 import { getPrefixRestriction } from '../config/commands/prefixRestrictions.js';
 
@@ -25,7 +31,10 @@ import {
     isMaintenanceMode
 } from '../config/bot.js';
 
-import { enforceAbuseProtection, formatCooldownDuration } from '../utils/abuseProtection.js';
+import {
+    enforceAbuseProtection,
+    formatCooldownDuration
+} from '../utils/abuseProtection.js';
 
 import { createEmbed } from '../utils/embeds.js';
 
@@ -44,7 +53,6 @@ import { getRobloxStatus } from '../services/robloxService.js';
 
 
 const MESSAGE_XP_RATE_LIMIT_ATTEMPTS = 12;
-
 const MESSAGE_XP_RATE_LIMIT_WINDOW_MS = 10000;
 
 
@@ -57,7 +65,6 @@ export default {
         try {
 
             // Ignore messages sent by bots
-
             if (message.author.bot) return;
 
 
@@ -87,7 +94,8 @@ export default {
             // COUNTING GAME
             // =========================
 
-            const countingProcessed = await handleCountingGame(message, client);
+            const countingProcessed =
+                await handleCountingGame(message, client);
 
             if (countingProcessed) {
 
@@ -100,7 +108,8 @@ export default {
             // ROBLOX STATUS
             // =========================
 
-            const robloxProcessed = await handleRobloxMention(message, client);
+            const robloxProcessed =
+                await handleRobloxMention(message, client);
 
             if (robloxProcessed) {
 
@@ -138,7 +147,7 @@ export default {
 
 
 /**
- * Handles Roblox status requests made by mentioning ORBITLY.
+ * Handles Roblox status requests by mentioning ORBITLY.
  *
  * Examples:
  *
@@ -159,33 +168,45 @@ async function handleRobloxMention(message, client) {
         }
 
 
-        // Only respond when ORBITLY itself is mentioned.
+        // =========================
+        // DETECT ORBITLY MENTION
+        // =========================
 
-        if (!message.mentions.users.has(client.user.id)) {
+        const botMentionRegex =
+            new RegExp(`<@!?${client.user.id}>`, 'i');
+
+
+        if (!botMentionRegex.test(message.content)) {
 
             return false;
 
         }
 
 
-        // Remove the ORBITLY mention from the message.
-
-        const content = message.content
-            .replace(
-                new RegExp(`<@!?${client.user.id}>`, 'g'),
-                ''
-            )
-            .trim();
-
-
-        // Try to extract a Roblox username.
-
-        const match = content.match(
-            /(?:is|check|status(?:\s+of)?|where\s+is|what(?:\s+is)?\s+)([A-Za-z0-9_]{3,20})/i
+        logger.info(
+            `ORBITLY mention detected: ${message.content}`
         );
 
 
-        // The message mentioned ORBITLY, but wasn't a Roblox request.
+        // Remove ORBITLY's mention
+
+        const content =
+            message.content
+                .replace(botMentionRegex, '')
+                .trim();
+
+
+        // =========================
+        // PARSE ROBLOX REQUEST
+        // =========================
+
+        const match =
+            content.match(
+                /(?:is|check|status|where\s+is|what(?:\s+is)?)\s+([A-Za-z0-9_]{3,20})/i
+            );
+
+
+        // Mentioned ORBITLY but didn't ask about Roblox
 
         if (!match) {
 
@@ -205,7 +226,12 @@ async function handleRobloxMention(message, client) {
         await message.channel.sendTyping();
 
 
-        const result = await getRobloxStatus(username);
+        // =========================
+        // ROBLOX LOOKUP
+        // =========================
+
+        const result =
+            await getRobloxStatus(username);
 
 
         // =========================
@@ -227,10 +253,13 @@ async function handleRobloxMention(message, client) {
 
 
         // =========================
-        // NO PRESENCE DATA
+        // OFFLINE
         // =========================
 
-        if (!presence) {
+        if (
+            !presence ||
+            presence.userPresenceType === 0
+        ) {
 
             await message.reply(
                 `🔴 **${result.user.name}** is offline.`
@@ -242,20 +271,16 @@ async function handleRobloxMention(message, client) {
 
 
         // =========================
-        // ROBLOX PRESENCE TYPES
+        // PRESENCE TYPES
         // =========================
 
         const statuses = {
-
-            0: '🔴 Offline',
 
             1: '🟢 Online',
 
             2: '🎮 In Game',
 
-            3: '🛠️ In Roblox Studio',
-
-            4: '📱 Online'
+            3: '🛠️ In Roblox Studio'
 
         };
 
@@ -270,9 +295,7 @@ async function handleRobloxMention(message, client) {
         // =========================
 
         await message.reply(
-
             `**${result.user.name}** is currently **${status}**.`
-
         );
 
 
@@ -897,6 +920,7 @@ async function handleDM(message) {
 
 
         await message.reply(response);
+
 
     } catch (error) {
 
