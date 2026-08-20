@@ -23,9 +23,9 @@ export const botConfig = {
     // 5 = Competing
     activities: [
       {
-        name: "White Flames", // required by Discord API, not shown in the client
-        state: "to Mr. White Latte",     // this is what people actually see
-        type: "2",               // Custom
+        name: "Your disgusting activities", // required by Discord API, not shown in the client
+        state: "I saw that bro...",     // this is what people actually see
+        type: "3",               // Custom
       },
     ],
   },
