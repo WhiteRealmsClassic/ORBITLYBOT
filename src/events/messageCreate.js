@@ -1,703 +1,910 @@
 import { Events } from 'discord.js';
+
 import { logger } from '../utils/logger.js';
 
 import { getLevelingConfig, getUserLevelData } from '../services/leveling/leveling.js';
+
 import { addXp } from '../services/leveling/xpSystem.js';
+
 import { checkRateLimit } from '../utils/rateLimiter.js';
-
 import { parsePrefixCommand } from '../utils/prefixParser.js';
-import {
-  supportsPrefixExecution,
-  executePrefixCommand,
-  resolvePrefixAccessKey
-} from '../utils/messageAdapter.js';
 
-import {
-  resolveCommandAlias,
-  resolveSubcommandAlias
-} from '../config/commands/commandAliases.js';
+import { supportsPrefixExecution, executePrefixCommand, resolvePrefixAccessKey } from '../utils/messageAdapter.js';
+
+import { resolveCommandAlias, resolveSubcommandAlias } from '../config/commands/commandAliases.js';
 
 import { getPrefixRestriction } from '../config/commands/prefixRestrictions.js';
+
 import { getGuildConfig } from '../services/config/guildConfig.js';
 
 import {
-  getCommandPrefix,
-  getBotMessage,
-  isBotOwner,
-  isCommandCategoryEnabled,
-  isMaintenanceMode
+    getCommandPrefix,
+    getBotMessage,
+    isBotOwner,
+    isCommandCategoryEnabled,
+    isMaintenanceMode
 } from '../config/bot.js';
 
-import {
-  enforceAbuseProtection,
-  formatCooldownDuration
-} from '../utils/abuseProtection.js';
+import { enforceAbuseProtection, formatCooldownDuration } from '../utils/abuseProtection.js';
 
 import { createEmbed } from '../utils/embeds.js';
+
 import { isCommandEnabled } from '../services/commandAccessService.js';
 
 import {
-  getCountingGameConfig,
-  saveCountingGameConfig,
-  isValidCountingMessage,
-  recordCorrectCount
+    getCountingGameConfig,
+    saveCountingGameConfig,
+    isValidCountingMessage,
+    recordCorrectCount
 } from '../services/countingGameService.js';
 
-import { generateGroqResponse } from '../services/GroqService.js';
+import { askGroq } from '../services/GroqService.js';
+
+import { getRobloxStatus } from '../services/robloxService.js';
+
 
 const MESSAGE_XP_RATE_LIMIT_ATTEMPTS = 12;
+
 const MESSAGE_XP_RATE_LIMIT_WINDOW_MS = 10000;
 
-/*
- * Stores a small conversation history per user.
- *
- * This is intentionally in-memory.
- * Restarting the bot clears the conversation history.
- */
-const dmConversations = new Map();
-
-const MAX_HISTORY_MESSAGES = 10;
 
 export default {
-  name: Events.MessageCreate,
 
-  async execute(message, client) {
-    try {
-      // Ignore bots.
-      if (message.author.bot) {
-        return;
-      }
+    name: Events.MessageCreate,
 
-      /*
-       * ============================
-       * DIRECT MESSAGE AI
-       * ============================
-       *
-       * DMs do NOT have message.guild.
-       * Therefore this MUST happen before
-       * the guild-only logic below.
-       */
+    async execute(message, client) {
 
-      if (!message.guild) {
-        await handleDirectMessage(message);
-        return;
-      }
+        try {
 
-      /*
-       * ============================
-       * NORMAL GUILD MESSAGE LOGIC
-       * ============================
-       */
+            // Ignore messages sent by bots
 
-      logger.debug(
-        `Message received from ${message.author.tag}: ${message.content}`
-      );
+            if (message.author.bot) return;
 
-      const countingProcessed = await handleCountingGame(message, client);
 
-      if (countingProcessed) {
-        return;
-      }
+            // =========================
+            // GROQ AI DM HANDLER
+            // =========================
 
-      await handlePrefixCommand(message, client);
+            if (!message.guild) {
 
-      await handleLeveling(message, client);
+                await handleDM(message);
 
-    } catch (error) {
-      logger.error('Error in messageCreate event:', error);
+                return;
+
+            }
+
+
+            // =========================
+            // SERVER MESSAGE HANDLING
+            // =========================
+
+            logger.debug(
+                `Message received from ${message.author.tag}: ${message.content}`
+            );
+
+
+            // =========================
+            // COUNTING GAME
+            // =========================
+
+            const countingProcessed = await handleCountingGame(message, client);
+
+            if (countingProcessed) {
+
+                return;
+
+            }
+
+
+            // =========================
+            // ROBLOX STATUS
+            // =========================
+
+            const robloxProcessed = await handleRobloxMention(message, client);
+
+            if (robloxProcessed) {
+
+                return;
+
+            }
+
+
+            // =========================
+            // PREFIX COMMANDS
+            // =========================
+
+            await handlePrefixCommand(message, client);
+
+
+            // =========================
+            // LEVELING
+            // =========================
+
+            await handleLeveling(message, client);
+
+
+        } catch (error) {
+
+            logger.error(
+                'Error in messageCreate event:',
+                error
+            );
+
+        }
+
     }
-  }
+
 };
 
 
-/*
- * ==========================================
- * DM AI HANDLER
- * ==========================================
+/**
+ * Handles Roblox status requests made by mentioning ORBITLY.
+ *
+ * Examples:
+ *
+ * @ORBITLY is White online?
+ * @ORBITLY check White
+ * @ORBITLY status White
+ * @ORBITLY where is White?
  */
 
-async function handleDirectMessage(message) {
-  try {
-    const content = message.content?.trim();
-
-    if (!content) {
-      return;
-    }
-
-    logger.info(
-      `AI DM received from ${message.author.tag}: ${content}`
-    );
-
-    /*
-     * Get this user's conversation history.
-     *
-     * Each Discord user gets their own separate
-     * conversation.
-     */
-
-    let history = dmConversations.get(message.author.id);
-
-    if (!history) {
-      history = [];
-      dmConversations.set(message.author.id, history);
-    }
-
-    /*
-     * Add the user's message.
-     */
-
-    history.push({
-      role: 'user',
-      content
-    });
-
-    /*
-     * Prevent the conversation from becoming
-     * ridiculously large.
-     */
-
-    if (history.length > MAX_HISTORY_MESSAGES) {
-      history = history.slice(-MAX_HISTORY_MESSAGES);
-
-      dmConversations.set(
-        message.author.id,
-        history
-      );
-    }
-
-    await message.channel.sendTyping();
-
-    /*
-     * Send the conversation to Groq.
-     */
-
-    const response = await generateGroqResponse(history);
-
-    if (!response) {
-      await message.reply(
-        'I could not generate a response right now.'
-      );
-
-      return;
-    }
-
-    /*
-     * Save the AI response into this user's
-     * conversation history.
-     */
-
-    history.push({
-      role: 'assistant',
-      content: response
-    });
-
-    /*
-     * Discord messages have a 2000 character limit.
-     */
-
-    if (response.length <= 2000) {
-      await message.reply(response);
-      return;
-    }
-
-    /*
-     * Split long AI responses into chunks.
-     */
-
-    const chunks = splitMessage(response, 1900);
-
-    for (const chunk of chunks) {
-      await message.channel.send(chunk);
-    }
-
-  } catch (error) {
-    logger.error(
-      `Error handling AI DM from ${message.author.tag}:`,
-      error
-    );
+async function handleRobloxMention(message, client) {
 
     try {
-      await message.reply(
-        'Something went wrong while talking to the AI.'
-      );
-    } catch {
-      // Ignore Discord reply errors.
+
+        if (!client.user) {
+
+            return false;
+
+        }
+
+
+        // Only respond when ORBITLY itself is mentioned.
+
+        if (!message.mentions.users.has(client.user.id)) {
+
+            return false;
+
+        }
+
+
+        // Remove the ORBITLY mention from the message.
+
+        const content = message.content
+            .replace(
+                new RegExp(`<@!?${client.user.id}>`, 'g'),
+                ''
+            )
+            .trim();
+
+
+        // Try to extract a Roblox username.
+
+        const match = content.match(
+            /(?:is|check|status(?:\s+of)?|where\s+is|what(?:\s+is)?\s+)([A-Za-z0-9_]{3,20})/i
+        );
+
+
+        // The message mentioned ORBITLY, but wasn't a Roblox request.
+
+        if (!match) {
+
+            return false;
+
+        }
+
+
+        const username = match[1];
+
+
+        logger.info(
+            `Roblox status request for ${username} by ${message.author.tag}`
+        );
+
+
+        await message.channel.sendTyping();
+
+
+        const result = await getRobloxStatus(username);
+
+
+        // =========================
+        // USER NOT FOUND
+        // =========================
+
+        if (!result.found) {
+
+            await message.reply(
+                `❌ I couldn't find a Roblox user named **${username}**.`
+            );
+
+            return true;
+
+        }
+
+
+        const presence = result.presence;
+
+
+        // =========================
+        // NO PRESENCE DATA
+        // =========================
+
+        if (!presence) {
+
+            await message.reply(
+                `🔴 **${result.user.name}** is offline.`
+            );
+
+            return true;
+
+        }
+
+
+        // =========================
+        // ROBLOX PRESENCE TYPES
+        // =========================
+
+        const statuses = {
+
+            0: '🔴 Offline',
+
+            1: '🟢 Online',
+
+            2: '🎮 In Game',
+
+            3: '🛠️ In Roblox Studio',
+
+            4: '📱 Online'
+
+        };
+
+
+        const status =
+            statuses[presence.userPresenceType] ??
+            '❓ Unknown';
+
+
+        // =========================
+        // RESPONSE
+        // =========================
+
+        await message.reply(
+
+            `**${result.user.name}** is currently **${status}**.`
+
+        );
+
+
+        return true;
+
+
+    } catch (error) {
+
+        logger.error(
+            'Roblox presence lookup failed:',
+            error
+        );
+
+
+        await message.reply(
+            '⚠️ I couldn’t check Roblox right now.'
+        ).catch(() => {});
+
+
+        return true;
+
     }
-  }
+
 }
 
-
-/*
- * ==========================================
- * SPLIT LONG DISCORD MESSAGES
- * ==========================================
- */
-
-function splitMessage(text, maxLength = 1900) {
-  const chunks = [];
-
-  for (let i = 0; i < text.length; i += maxLength) {
-    chunks.push(text.slice(i, i + maxLength));
-  }
-
-  return chunks;
-}
-
-
-/*
- * ==========================================
- * PREFIX COMMANDS
- * ==========================================
- */
 
 async function handlePrefixCommand(message, client) {
-  try {
-    const guildConfig = await getGuildConfig(
-      client,
-      message.guild.id
-    );
 
-    const prefix =
-      guildConfig?.prefix || getCommandPrefix();
+    try {
 
-    const parsed = parsePrefixCommand(
-      message.content,
-      prefix
-    );
+        const guildConfig =
+            await getGuildConfig(
+                client,
+                message.guild.id
+            );
 
-    if (!parsed) {
-      return;
-    }
 
-    let { commandName, args } = parsed;
+        const prefix =
+            guildConfig?.prefix ||
+            getCommandPrefix();
 
-    const musicPrefixShortcut =
-      commandName.toLowerCase();
 
-    const MUSIC_PREFIX_SHORTCUTS = new Set([
-      'leave',
-      'pause',
-      'resume',
-      'skip',
-      'stop',
-      'volume'
-    ]);
+        const parsed =
+            parsePrefixCommand(
+                message.content,
+                prefix
+            );
 
-    if (
-      MUSIC_PREFIX_SHORTCUTS.has(
-        musicPrefixShortcut
-      )
-    ) {
-      commandName = 'music';
 
-      args = [
-        musicPrefixShortcut,
-        ...args
-      ];
-    }
+        if (!parsed) {
 
-    logger.info(
-      `Prefix command detected: ${commandName}, args: ${args.join(', ')}`
-    );
+            return;
 
-    const resolvedCommandName =
-      resolveCommandAlias(commandName);
+        }
 
-    logger.info(
-      `Resolved command name: ${resolvedCommandName}`
-    );
 
-    const command =
-      client.commands.get(resolvedCommandName);
+        let {
+            commandName,
+            args
+        } = parsed;
 
-    if (!command) {
-      logger.warn(
-        `Command not found: ${resolvedCommandName}`
-      );
 
-      return;
-    }
+        const musicPrefixShortcut =
+            commandName.toLowerCase();
 
-    if (
-      isMaintenanceMode() &&
-      !isBotOwner(message.author.id)
-    ) {
-      await message.channel.send({
-        embeds: [
-          createEmbed({
-            title: 'Maintenance Mode',
-            description:
-              getBotMessage('maintenanceMode'),
-            color: 'warning'
-          })
-        ]
-      }).catch(() => {});
 
-      return;
-    }
+        const MUSIC_PREFIX_SHORTCUTS =
+            new Set([
+                'leave',
+                'pause',
+                'resume',
+                'skip',
+                'stop',
+                'volume'
+            ]);
 
-    if (
-      !isCommandCategoryEnabled(
-        command.category
-      )
-    ) {
-      await message.channel.send({
-        embeds: [
-          createEmbed({
-            title: 'Feature Disabled',
-            description:
-              getBotMessage('commandDisabled'),
-            color: 'error'
-          })
-        ]
-      }).catch(() => {});
 
-      return;
-    }
+        if (
+            MUSIC_PREFIX_SHORTCUTS.has(
+                musicPrefixShortcut
+            )
+        ) {
 
-    const restriction =
-      getPrefixRestriction(
-        command,
-        args,
-        resolveSubcommandAlias
-      );
+            commandName = 'music';
 
-    if (
-      !supportsPrefixExecution(command) ||
-      restriction.blocked
-    ) {
-      if (
-        restriction.blocked &&
-        restriction.reason
-      ) {
-        const embed = createEmbed({
-          title: 'Slash Command Only',
-          description:
-            `${restriction.reason}\nUse \`/${resolvedCommandName}\` instead.`,
-          color: 'info'
-        });
+            args = [
+                musicPrefixShortcut,
+                ...args
+            ];
 
-        await message.channel.send({
-          embeds: [embed]
-        }).catch(() => {});
-      }
+        }
 
-      return;
-    }
 
-    if (
-      !(await isCommandEnabled(
-        client,
-        message.guild.id,
-        resolvePrefixAccessKey(
-          command.data,
-          args
-        ),
-        command.category
-      ))
-    ) {
-      const embed = createEmbed({
-        title: 'Command Disabled',
-        description:
-          'This command has been disabled for this server.',
-        color: 'error'
-      });
-
-      await message.channel.send({
-        embeds: [embed]
-      }).catch(() => {});
-
-      return;
-    }
-
-    const mockInteractionForProtection = {
-      guildId: message.guild.id,
-      user: message.author
-    };
-
-    const abuseProtection =
-      await enforceAbuseProtection(
-        mockInteractionForProtection,
-        command,
-        resolvedCommandName
-      );
-
-    if (!abuseProtection.allowed) {
-      const formattedCooldown =
-        formatCooldownDuration(
-          abuseProtection.remainingMs
+        logger.info(
+            `Prefix command detected: ${commandName}, args: ${args.join(', ')}`
         );
 
-      const embed = createEmbed({
-        title: 'Command Cooldown',
-        description:
-          `This command is on cooldown. Please wait ${formattedCooldown} before trying again.`,
-        color: 'error'
-      });
 
-      await message.channel.send({
-        embeds: [embed]
-      }).catch(() => {});
+        const resolvedCommandName =
+            resolveCommandAlias(commandName);
 
-      return;
+
+        logger.info(
+            `Resolved command name: ${resolvedCommandName}`
+        );
+
+
+        const command =
+            client.commands.get(
+                resolvedCommandName
+            );
+
+
+        if (!command) {
+
+            logger.warn(
+                `Command not found: ${resolvedCommandName}`
+            );
+
+            return;
+
+        }
+
+
+        if (
+            isMaintenanceMode() &&
+            !isBotOwner(message.author.id)
+        ) {
+
+            await message.channel.send({
+
+                embeds: [
+
+                    createEmbed({
+
+                        title: 'Maintenance Mode',
+
+                        description:
+                            getBotMessage(
+                                'maintenanceMode'
+                            ),
+
+                        color: 'warning'
+
+                    })
+
+                ]
+
+            }).catch(() => {});
+
+
+            return;
+
+        }
+
+
+        if (
+            !isCommandCategoryEnabled(
+                command.category
+            )
+        ) {
+
+            await message.channel.send({
+
+                embeds: [
+
+                    createEmbed({
+
+                        title: 'Feature Disabled',
+
+                        description:
+                            getBotMessage(
+                                'commandDisabled'
+                            ),
+
+                        color: 'error'
+
+                    })
+
+                ]
+
+            }).catch(() => {});
+
+
+            return;
+
+        }
+
+
+        const restriction =
+            getPrefixRestriction(
+                command,
+                args,
+                resolveSubcommandAlias
+            );
+
+
+        if (
+            !supportsPrefixExecution(command) ||
+            restriction.blocked
+        ) {
+
+            if (
+                restriction.blocked &&
+                restriction.reason
+            ) {
+
+                const embed =
+                    createEmbed({
+
+                        title:
+                            'Slash Command Only',
+
+                        description:
+                            `${restriction.reason}\nUse \`/${resolvedCommandName}\` instead.`,
+
+                        color: 'info'
+
+                    });
+
+
+                await message.channel
+                    .send({
+                        embeds: [embed]
+                    })
+                    .catch(() => {});
+
+            }
+
+
+            return;
+
+        }
+
+
+        if (
+            !(await isCommandEnabled(
+
+                client,
+
+                message.guild.id,
+
+                resolvePrefixAccessKey(
+                    command.data,
+                    args
+                ),
+
+                command.category
+
+            ))
+        ) {
+
+            const embed =
+                createEmbed({
+
+                    title:
+                        'Command Disabled',
+
+                    description:
+                        'This command has been disabled for this server.',
+
+                    color: 'error'
+
+                });
+
+
+            await message.channel
+                .send({
+                    embeds: [embed]
+                })
+                .catch(() => {});
+
+
+            return;
+
+        }
+
+
+        const mockInteractionForProtection = {
+
+            guildId:
+                message.guild.id,
+
+            user:
+                message.author
+
+        };
+
+
+        const abuseProtection =
+            await enforceAbuseProtection(
+
+                mockInteractionForProtection,
+
+                command,
+
+                resolvedCommandName
+
+            );
+
+
+        if (!abuseProtection.allowed) {
+
+            const formattedCooldown =
+                formatCooldownDuration(
+                    abuseProtection.remainingMs
+                );
+
+
+            const embed =
+                createEmbed({
+
+                    title:
+                        'Command Cooldown',
+
+                    description:
+                        `This command is on cooldown. Please wait ${formattedCooldown} before trying again.`,
+
+                    color: 'error'
+
+                });
+
+
+            await message.channel
+                .send({
+                    embeds: [embed]
+                })
+                .catch(() => {});
+
+
+            return;
+
+        }
+
+
+        logger.info(
+            `Executing prefix command: ${prefix}${commandName} (resolved to ${resolvedCommandName}) by ${message.author.tag}`
+        );
+
+
+        await executePrefixCommand(
+
+            command,
+
+            message,
+
+            args,
+
+            client,
+
+            prefix,
+
+            guildConfig
+
+        );
+
+
+    } catch (error) {
+
+        logger.error(
+            'Error handling prefix command:',
+            error
+        );
+
     }
 
-    logger.info(
-      `Executing prefix command: ${prefix}${commandName} (resolved to ${resolvedCommandName}) by ${message.author.tag}`
-    );
-
-    await executePrefixCommand(
-      command,
-      message,
-      args,
-      client,
-      prefix,
-      guildConfig
-    );
-
-  } catch (error) {
-    logger.error(
-      'Error handling prefix command:',
-      error
-    );
-  }
 }
 
-
-/*
- * ==========================================
- * COUNTING GAME
- * ==========================================
- */
 
 async function handleCountingGame(message, client) {
-  try {
-    const config =
-      await getCountingGameConfig(
-        client,
-        message.guild.id
-      );
 
-    if (
-      !config.enabled ||
-      !config.channelId ||
-      message.channel.id !== config.channelId
-    ) {
-      return false;
-    }
+    try {
 
-    const content =
-      message.content.trim();
+        const config =
+            await getCountingGameConfig(
+                client,
+                message.guild.id
+            );
 
-    const validCount =
-      isValidCountingMessage(
-        content,
-        config
-      );
 
-    const invalidAttempt =
-      !validCount ||
-      message.author.id === config.lastUserId;
+        if (
+            !config.enabled ||
+            !config.channelId ||
+            message.channel.id !== config.channelId
+        ) {
 
-    if (invalidAttempt) {
-      await message.delete().catch(() => {});
+            return false;
 
-      await saveCountingGameConfig(
-        client,
-        message.guild.id,
-        {
-          ...config,
-          nextNumber: 1,
-          lastUserId: null,
-          currentStreak: 0
         }
-      );
 
-      const failureMessage =
-        await message.channel.send(
-          `❌ Count broken by <@${message.author.id}>. The sequence has been reset to **1**.`
+
+        const content =
+            message.content.trim();
+
+
+        const validCount =
+            isValidCountingMessage(
+                content,
+                config
+            );
+
+
+        const invalidAttempt =
+            !validCount ||
+            message.author.id === config.lastUserId;
+
+
+        if (invalidAttempt) {
+
+            await message.delete()
+                .catch(() => {});
+
+
+            await saveCountingGameConfig(
+
+                client,
+
+                message.guild.id,
+
+                {
+
+                    ...config,
+
+                    nextNumber: 1,
+
+                    lastUserId: null,
+
+                    currentStreak: 0
+
+                }
+
+            );
+
+
+            const failureMessage =
+                await message.channel.send(
+
+                    `❌ Count broken by <@${message.author.id}>. The sequence has been reset to **1**.`
+
+                );
+
+
+            setTimeout(() => {
+
+                failureMessage
+                    .delete()
+                    .catch(() => {});
+
+            }, 10000);
+
+
+            return true;
+
+        }
+
+
+        await recordCorrectCount(
+
+            client,
+
+            message.guild.id,
+
+            message.author.id
+
         );
 
-      setTimeout(() => {
-        failureMessage
-          .delete()
-          .catch(() => {});
-      }, 10000);
 
-      return true;
+        return true;
+
+
+    } catch (error) {
+
+        logger.error(
+            'Error handling counting game:',
+            error
+        );
+
+
+        return false;
+
     }
 
-    await recordCorrectCount(
-      client,
-      message.guild.id,
-      message.author.id
-    );
-
-    return true;
-
-  } catch (error) {
-    logger.error(
-      'Error handling counting game:',
-      error
-    );
-
-    return false;
-  }
 }
 
 
-/*
- * ==========================================
- * LEVELING
- * ==========================================
- */
-
 async function handleLeveling(message, client) {
-  try {
-    const rateLimitKey =
-      `xp-event:${message.guild.id}:${message.author.id}`;
 
-    const canProcess =
-      await checkRateLimit(
-        rateLimitKey,
-        MESSAGE_XP_RATE_LIMIT_ATTEMPTS,
-        MESSAGE_XP_RATE_LIMIT_WINDOW_MS
-      );
+    try {
 
-    if (!canProcess) {
-      return;
-    }
+        const rateLimitKey =
+            `xp-event:${message.guild.id}:${message.author.id}`;
 
-    const levelingConfig =
-      await getLevelingConfig(
-        client,
-        message.guild.id
-      );
 
-    if (!levelingConfig?.enabled) {
-      return;
-    }
+        const canProcess =
+            await checkRateLimit(
 
-    if (
-      levelingConfig.ignoredChannels?.includes(
-        message.channel.id
-      )
-    ) {
-      return;
-    }
+                rateLimitKey,
 
-    if (
-      levelingConfig.ignoredRoles?.length > 0
-    ) {
-      const member =
-        await message.guild.members
-          .fetch(message.author.id)
-          .catch(() => null);
+                MESSAGE_XP_RATE_LIMIT_ATTEMPTS,
 
-      if (
-        member &&
-        member.roles.cache.some(
-          role =>
-            levelingConfig.ignoredRoles.includes(
-              role.id
-            )
-        )
-      ) {
-        return;
-      }
-    }
+                MESSAGE_XP_RATE_LIMIT_WINDOW_MS
 
-    if (
-      levelingConfig.blacklistedUsers?.includes(
-        message.author.id
-      )
-    ) {
-      return;
-    }
+            );
 
-    if (
-      !message.content ||
-      message.content.trim().length === 0
-    ) {
-      return;
-    }
 
-    const userData =
-      await getUserLevelData(
-        client,
-        message.guild.id,
-        message.author.id
-      );
+        if (!canProcess) {
 
-    const cooldownTime =
-      levelingConfig.xpCooldown || 60;
+            return;
 
-    const now = Date.now();
+        }
 
-    const timeSinceLastMessage =
-      now -
-      (userData.lastMessage || 0);
 
-    if (
-      timeSinceLastMessage <
-      cooldownTime * 1000
-    ) {
-      return;
-    }
+        const config =
+            await getLevelingConfig(
 
-    const minXP =
-      levelingConfig.xpRange?.min ||
-      levelingConfig.xpPerMessage?.min ||
-      15;
+                client,
 
-    const maxXP =
-      levelingConfig.xpRange?.max ||
-      levelingConfig.xpPerMessage?.max ||
-      25;
+                message.guild.id
 
-    const safeMinXP =
-      Math.max(1, minXP);
+            );
 
-    const safeMaxXP =
-      Math.max(safeMinXP, maxXP);
 
-    const xpToGive =
-      Math.floor(
-        Math.random() *
-        (safeMaxXP - safeMinXP + 1)
-      ) + safeMinXP;
+        if (!config?.enabled) {
 
-    let finalXP = xpToGive;
+            return;
 
-    if (
-      levelingConfig.xpMultiplier &&
-      levelingConfig.xpMultiplier > 1
-    ) {
-      finalXP =
-        Math.floor(
-          finalXP *
-          levelingConfig.xpMultiplier
+        }
+
+
+        const userData =
+            await getUserLevelData(
+
+                client,
+
+                message.guild.id,
+
+                message.author.id
+
+            );
+
+
+        const result =
+            await addXp(
+
+                client,
+
+                message.guild.id,
+
+                message.author.id,
+
+                userData,
+
+                config
+
+            );
+
+
+        if (
+            result?.levelUp &&
+            result.newLevel
+        ) {
+
+            const embed =
+                createEmbed({
+
+                    title:
+                        'Level Up!',
+
+                    description:
+                        `Congratulations <@${message.author.id}>! You reached **Level ${result.newLevel}**.`,
+
+                    color: 'success'
+
+                });
+
+
+            await message.channel
+                .send({
+                    embeds: [embed]
+                })
+                .catch(() => {});
+
+        }
+
+
+    } catch (error) {
+
+        logger.error(
+            'Error handling leveling:',
+            error
         );
+
     }
 
-    const result =
-      await addXp(
-        client,
-        message.guild,
-        message.member,
-        finalXP
-      );
+}
 
-    if (result?.leveledUp) {
-      logger.info(
-        `${message.author.tag} leveled up to level ${result.level} in ${message.guild.name}`
-      );
+
+async function handleDM(message) {
+
+    try {
+
+        const content =
+            message.content.trim();
+
+
+        if (!content) {
+
+            return;
+
+        }
+
+
+        const response =
+            await askGroq(content);
+
+
+        if (!response) {
+
+            return;
+
+        }
+
+
+        await message.reply(response);
+
+    } catch (error) {
+
+        logger.error(
+            'Error handling DM:',
+            error
+        );
+
     }
 
-  } catch (error) {
-    logger.error(
-      'Error handling leveling for message:',
-      error
-    );
-  }
 }
