@@ -1,17 +1,11 @@
 import { Events } from 'discord.js';
 import { logger } from '../utils/logger.js';
 
-import {
-  getLevelingConfig,
-  getUserLevelData
-} from '../services/leveling/leveling.js';
-
+import { getLevelingConfig, getUserLevelData } from '../services/leveling/leveling.js';
 import { addXp } from '../services/leveling/xpSystem.js';
-
 import { checkRateLimit } from '../utils/rateLimiter.js';
 
 import { parsePrefixCommand } from '../utils/prefixParser.js';
-
 import {
   supportsPrefixExecution,
   executePrefixCommand,
@@ -23,13 +17,8 @@ import {
   resolveSubcommandAlias
 } from '../config/commands/commandAliases.js';
 
-import {
-  getPrefixRestriction
-} from '../config/commands/prefixRestrictions.js';
-
-import {
-  getGuildConfig
-} from '../services/config/guildConfig.js';
+import { getPrefixRestriction } from '../config/commands/prefixRestrictions.js';
+import { getGuildConfig } from '../services/config/guildConfig.js';
 
 import {
   getCommandPrefix,
@@ -45,210 +34,260 @@ import {
 } from '../utils/abuseProtection.js';
 
 import { createEmbed } from '../utils/embeds.js';
-
-import {
-  isCommandEnabled
-} from '../services/commandAccessService.js';
+import { isCommandEnabled } from '../services/commandAccessService.js';
 
 import {
   getCountingGameConfig,
   saveCountingGameConfig,
   isValidCountingMessage,
-  recordCorrectCount,
+  recordCorrectCount
 } from '../services/countingGameService.js';
 
-import { askGroq } from '../services/GroqService.js';
+import { generateGroqResponse } from '../services/GroqService.js';
 
 const MESSAGE_XP_RATE_LIMIT_ATTEMPTS = 12;
 const MESSAGE_XP_RATE_LIMIT_WINDOW_MS = 10000;
+
+/*
+ * Stores a small conversation history per user.
+ *
+ * This is intentionally in-memory.
+ * Restarting the bot clears the conversation history.
+ */
+const dmConversations = new Map();
+
+const MAX_HISTORY_MESSAGES = 10;
 
 export default {
   name: Events.MessageCreate,
 
   async execute(message, client) {
-
-    // ==========================================
-    // DEBUG: CONFIRM MESSAGE EVENT IS RECEIVED
-    // ==========================================
-
-    console.log(
-      `[MESSAGE EVENT] guild=${message.guild?.id ?? 'DM'} author=${message.author?.tag ?? 'unknown'} content=${message.content ?? ''}`
-    );
-
     try {
-
-      // Ignore messages sent by bots
+      // Ignore bots.
       if (message.author.bot) {
         return;
       }
 
-      // ==========================================
-      // DIRECT MESSAGE / DM HANDLING
-      // ==========================================
+      /*
+       * ============================
+       * DIRECT MESSAGE AI
+       * ============================
+       *
+       * DMs do NOT have message.guild.
+       * Therefore this MUST happen before
+       * the guild-only logic below.
+       */
 
       if (!message.guild) {
-
-        console.log(
-          `[DM] Received DM from ${message.author.tag}: ${message.content}`
-        );
-
-        await handleDM(message);
-
+        await handleDirectMessage(message);
         return;
       }
 
-      // ==========================================
-      // GUILD MESSAGE HANDLING
-      // ==========================================
+      /*
+       * ============================
+       * NORMAL GUILD MESSAGE LOGIC
+       * ============================
+       */
 
       logger.debug(
         `Message received from ${message.author.tag}: ${message.content}`
       );
 
-      // Counting game
-      const countingProcessed =
-        await handleCountingGame(message, client);
+      const countingProcessed = await handleCountingGame(message, client);
 
       if (countingProcessed) {
         return;
       }
 
-      // Prefix commands
       await handlePrefixCommand(message, client);
 
-      // XP / leveling
       await handleLeveling(message, client);
 
     } catch (error) {
-
-      logger.error(
-        'Error in messageCreate event:',
-        error
-      );
-
+      logger.error('Error in messageCreate event:', error);
     }
   }
 };
 
 
-// ==================================================
-// DM → GROQ
-// ==================================================
+/*
+ * ==========================================
+ * DM AI HANDLER
+ * ==========================================
+ */
 
-async function handleDM(message) {
-
+async function handleDirectMessage(message) {
   try {
-
     const content = message.content?.trim();
 
     if (!content) {
       return;
     }
 
-    console.log(
-      `[DM] Sending message to Groq: ${content}`
+    logger.info(
+      `AI DM received from ${message.author.tag}: ${content}`
     );
 
-    // Show Discord typing indicator
-    await message.channel
-      .sendTyping()
-      .catch(() => {});
+    /*
+     * Get this user's conversation history.
+     *
+     * Each Discord user gets their own separate
+     * conversation.
+     */
 
-    // Ask Groq
-    const response = await askGroq(
-      message.author.id,
+    let history = dmConversations.get(message.author.id);
+
+    if (!history) {
+      history = [];
+      dmConversations.set(message.author.id, history);
+    }
+
+    /*
+     * Add the user's message.
+     */
+
+    history.push({
+      role: 'user',
       content
-    );
+    });
 
-    console.log(
-      `[DM] Groq response received`
-    );
+    /*
+     * Prevent the conversation from becoming
+     * ridiculously large.
+     */
+
+    if (history.length > MAX_HISTORY_MESSAGES) {
+      history = history.slice(-MAX_HISTORY_MESSAGES);
+
+      dmConversations.set(
+        message.author.id,
+        history
+      );
+    }
+
+    await message.channel.sendTyping();
+
+    /*
+     * Send the conversation to Groq.
+     */
+
+    const response = await generateGroqResponse(history);
 
     if (!response) {
-
-      await message.channel.send(
+      await message.reply(
         'I could not generate a response right now.'
       );
 
       return;
     }
 
-    // Send AI response
-    await message.channel.send(response);
+    /*
+     * Save the AI response into this user's
+     * conversation history.
+     */
+
+    history.push({
+      role: 'assistant',
+      content: response
+    });
+
+    /*
+     * Discord messages have a 2000 character limit.
+     */
+
+    if (response.length <= 2000) {
+      await message.reply(response);
+      return;
+    }
+
+    /*
+     * Split long AI responses into chunks.
+     */
+
+    const chunks = splitMessage(response, 1900);
+
+    for (const chunk of chunks) {
+      await message.channel.send(chunk);
+    }
 
   } catch (error) {
-
-    console.error(
-      '[DM] GROQ ERROR:',
-      error
-    );
-
     logger.error(
-      `Error handling DM from ${message.author.tag}:`,
+      `Error handling AI DM from ${message.author.tag}:`,
       error
     );
 
-    await message.channel.send(
-      'I ran into an error while processing your message.'
-    ).catch(() => {});
-
+    try {
+      await message.reply(
+        'Something went wrong while talking to the AI.'
+      );
+    } catch {
+      // Ignore Discord reply errors.
+    }
   }
 }
 
 
-// ==================================================
-// PREFIX COMMANDS
-// ==================================================
+/*
+ * ==========================================
+ * SPLIT LONG DISCORD MESSAGES
+ * ==========================================
+ */
+
+function splitMessage(text, maxLength = 1900) {
+  const chunks = [];
+
+  for (let i = 0; i < text.length; i += maxLength) {
+    chunks.push(text.slice(i, i + maxLength));
+  }
+
+  return chunks;
+}
+
+
+/*
+ * ==========================================
+ * PREFIX COMMANDS
+ * ==========================================
+ */
 
 async function handlePrefixCommand(message, client) {
-
   try {
-
-    const guildConfig =
-      await getGuildConfig(
-        client,
-        message.guild.id
-      );
+    const guildConfig = await getGuildConfig(
+      client,
+      message.guild.id
+    );
 
     const prefix =
-      guildConfig?.prefix ||
-      getCommandPrefix();
+      guildConfig?.prefix || getCommandPrefix();
 
-    const parsed =
-      parsePrefixCommand(
-        message.content,
-        prefix
-      );
+    const parsed = parsePrefixCommand(
+      message.content,
+      prefix
+    );
 
     if (!parsed) {
       return;
     }
 
-    let {
-      commandName,
-      args
-    } = parsed;
+    let { commandName, args } = parsed;
 
-    // Music shortcuts
     const musicPrefixShortcut =
       commandName.toLowerCase();
 
-    const MUSIC_PREFIX_SHORTCUTS =
-      new Set([
-        'leave',
-        'pause',
-        'resume',
-        'skip',
-        'stop',
-        'volume'
-      ]);
+    const MUSIC_PREFIX_SHORTCUTS = new Set([
+      'leave',
+      'pause',
+      'resume',
+      'skip',
+      'stop',
+      'volume'
+    ]);
 
     if (
       MUSIC_PREFIX_SHORTCUTS.has(
         musicPrefixShortcut
       )
     ) {
-
       commandName = 'music';
 
       args = [
@@ -261,24 +300,17 @@ async function handlePrefixCommand(message, client) {
       `Prefix command detected: ${commandName}, args: ${args.join(', ')}`
     );
 
-    // Resolve aliases
     const resolvedCommandName =
-      resolveCommandAlias(
-        commandName
-      );
+      resolveCommandAlias(commandName);
 
     logger.info(
       `Resolved command name: ${resolvedCommandName}`
     );
 
-    // Find command
     const command =
-      client.commands.get(
-        resolvedCommandName
-      );
+      client.commands.get(resolvedCommandName);
 
     if (!command) {
-
       logger.warn(
         `Command not found: ${resolvedCommandName}`
       );
@@ -286,58 +318,43 @@ async function handlePrefixCommand(message, client) {
       return;
     }
 
-    // Maintenance mode
     if (
       isMaintenanceMode() &&
-      !isBotOwner(
-        message.author.id
-      )
+      !isBotOwner(message.author.id)
     ) {
-
       await message.channel.send({
-
         embeds: [
           createEmbed({
             title: 'Maintenance Mode',
             description:
-              getBotMessage(
-                'maintenanceMode'
-              ),
-            color: 'warning',
+              getBotMessage('maintenanceMode'),
+            color: 'warning'
           })
-        ],
-
+        ]
       }).catch(() => {});
 
       return;
     }
 
-    // Category enabled
     if (
       !isCommandCategoryEnabled(
         command.category
       )
     ) {
-
       await message.channel.send({
-
         embeds: [
           createEmbed({
             title: 'Feature Disabled',
             description:
-              getBotMessage(
-                'commandDisabled'
-              ),
-            color: 'error',
+              getBotMessage('commandDisabled'),
+            color: 'error'
           })
-        ],
-
+        ]
       }).catch(() => {});
 
       return;
     }
 
-    // Prefix restriction
     const restriction =
       getPrefixRestriction(
         command,
@@ -346,44 +363,30 @@ async function handlePrefixCommand(message, client) {
       );
 
     if (
-      !supportsPrefixExecution(
-        command
-      ) ||
+      !supportsPrefixExecution(command) ||
       restriction.blocked
     ) {
-
       if (
         restriction.blocked &&
         restriction.reason
       ) {
+        const embed = createEmbed({
+          title: 'Slash Command Only',
+          description:
+            `${restriction.reason}\nUse \`/${resolvedCommandName}\` instead.`,
+          color: 'info'
+        });
 
-        const embed =
-          createEmbed({
-
-            title:
-              'Slash Command Only',
-
-            description:
-              `${restriction.reason}\nUse \`/${resolvedCommandName}\` instead.`,
-
-            color:
-              'info',
-
-          });
-
-        await message.channel
-          .send({
-            embeds: [embed]
-          })
-          .catch(() => {});
+        await message.channel.send({
+          embeds: [embed]
+        }).catch(() => {});
       }
 
       return;
     }
 
-    // Command enabled
-    const commandEnabled =
-      await isCommandEnabled(
+    if (
+      !(await isCommandEnabled(
         client,
         message.guild.id,
         resolvePrefixAccessKey(
@@ -391,42 +394,25 @@ async function handlePrefixCommand(message, client) {
           args
         ),
         command.category
-      );
+      ))
+    ) {
+      const embed = createEmbed({
+        title: 'Command Disabled',
+        description:
+          'This command has been disabled for this server.',
+        color: 'error'
+      });
 
-    if (!commandEnabled) {
-
-      const embed =
-        createEmbed({
-
-          title:
-            'Command Disabled',
-
-          description:
-            'This command has been disabled for this server.',
-
-          color:
-            'error',
-
-        });
-
-      await message.channel
-        .send({
-          embeds: [embed]
-        })
-        .catch(() => {});
+      await message.channel.send({
+        embeds: [embed]
+      }).catch(() => {});
 
       return;
     }
 
-    // Abuse protection
     const mockInteractionForProtection = {
-
-      guildId:
-        message.guild.id,
-
-      user:
-        message.author,
-
+      guildId: message.guild.id,
+      user: message.author
     };
 
     const abuseProtection =
@@ -436,34 +422,22 @@ async function handlePrefixCommand(message, client) {
         resolvedCommandName
       );
 
-    if (
-      !abuseProtection.allowed
-    ) {
-
+    if (!abuseProtection.allowed) {
       const formattedCooldown =
         formatCooldownDuration(
           abuseProtection.remainingMs
         );
 
-      const embed =
-        createEmbed({
+      const embed = createEmbed({
+        title: 'Command Cooldown',
+        description:
+          `This command is on cooldown. Please wait ${formattedCooldown} before trying again.`,
+        color: 'error'
+      });
 
-          title:
-            'Command Cooldown',
-
-          description:
-            `This command is on cooldown. Please wait ${formattedCooldown} before trying again.`,
-
-          color:
-            'error',
-
-        });
-
-      await message.channel
-        .send({
-          embeds: [embed]
-        })
-        .catch(() => {});
+      await message.channel.send({
+        embeds: [embed]
+      }).catch(() => {});
 
       return;
     }
@@ -482,27 +456,22 @@ async function handlePrefixCommand(message, client) {
     );
 
   } catch (error) {
-
     logger.error(
       'Error handling prefix command:',
       error
     );
-
   }
 }
 
 
-// ==================================================
-// COUNTING GAME
-// ==================================================
+/*
+ * ==========================================
+ * COUNTING GAME
+ * ==========================================
+ */
 
-async function handleCountingGame(
-  message,
-  client
-) {
-
+async function handleCountingGame(message, client) {
   try {
-
     const config =
       await getCountingGameConfig(
         client,
@@ -512,10 +481,8 @@ async function handleCountingGame(
     if (
       !config.enabled ||
       !config.channelId ||
-      message.channel.id !==
-        config.channelId
+      message.channel.id !== config.channelId
     ) {
-
       return false;
     }
 
@@ -530,29 +497,19 @@ async function handleCountingGame(
 
     const invalidAttempt =
       !validCount ||
-      message.author.id ===
-        config.lastUserId;
+      message.author.id === config.lastUserId;
 
     if (invalidAttempt) {
-
-      await message.delete()
-        .catch(() => {});
+      await message.delete().catch(() => {});
 
       await saveCountingGameConfig(
         client,
         message.guild.id,
         {
           ...config,
-
-          nextNumber:
-            1,
-
-          lastUserId:
-            null,
-
-          currentStreak:
-            0,
-
+          nextNumber: 1,
+          lastUserId: null,
+          currentStreak: 0
         }
       );
 
@@ -562,11 +519,9 @@ async function handleCountingGame(
         );
 
       setTimeout(() => {
-
         failureMessage
           .delete()
           .catch(() => {});
-
       }, 10000);
 
       return true;
@@ -581,7 +536,6 @@ async function handleCountingGame(
     return true;
 
   } catch (error) {
-
     logger.error(
       'Error handling counting game:',
       error
@@ -592,17 +546,14 @@ async function handleCountingGame(
 }
 
 
-// ==================================================
-// LEVELING
-// ==================================================
+/*
+ * ==========================================
+ * LEVELING
+ * ==========================================
+ */
 
-async function handleLeveling(
-  message,
-  client
-) {
-
+async function handleLeveling(message, client) {
   try {
-
     const rateLimitKey =
       `xp-event:${message.guild.id}:${message.author.id}`;
 
@@ -627,66 +578,47 @@ async function handleLeveling(
       return;
     }
 
-    // Ignored channels
     if (
-      levelingConfig
-        .ignoredChannels
-        ?.includes(
-          message.channel.id
-        )
+      levelingConfig.ignoredChannels?.includes(
+        message.channel.id
+      )
     ) {
-
       return;
     }
 
-    // Ignored roles
     if (
-      levelingConfig
-        .ignoredRoles
-        ?.length > 0
+      levelingConfig.ignoredRoles?.length > 0
     ) {
-
       const member =
         await message.guild.members
-          .fetch(
-            message.author.id
-          )
+          .fetch(message.author.id)
           .catch(() => null);
 
       if (
         member &&
         member.roles.cache.some(
           role =>
-            levelingConfig
-              .ignoredRoles
-              .includes(
-                role.id
-              )
+            levelingConfig.ignoredRoles.includes(
+              role.id
+            )
         )
       ) {
-
         return;
       }
     }
 
-    // Blacklisted users
     if (
-      levelingConfig
-        .blacklistedUsers
-        ?.includes(
-          message.author.id
-        )
+      levelingConfig.blacklistedUsers?.includes(
+        message.author.id
+      )
     ) {
-
       return;
     }
 
-    // Empty message
     if (
       !message.content ||
       message.content.trim().length === 0
     ) {
-
       return;
     }
 
@@ -698,11 +630,9 @@ async function handleLeveling(
       );
 
     const cooldownTime =
-      levelingConfig.xpCooldown ||
-      60;
+      levelingConfig.xpCooldown || 60;
 
-    const now =
-      Date.now();
+    const now = Date.now();
 
     const timeSinceLastMessage =
       now -
@@ -712,7 +642,6 @@ async function handleLeveling(
       timeSinceLastMessage <
       cooldownTime * 1000
     ) {
-
       return;
     }
 
@@ -727,36 +656,23 @@ async function handleLeveling(
       25;
 
     const safeMinXP =
-      Math.max(
-        1,
-        minXP
-      );
+      Math.max(1, minXP);
 
     const safeMaxXP =
-      Math.max(
-        safeMinXP,
-        maxXP
-      );
+      Math.max(safeMinXP, maxXP);
 
     const xpToGive =
       Math.floor(
         Math.random() *
-        (
-          safeMaxXP -
-          safeMinXP +
-          1
-        )
-      ) +
-      safeMinXP;
+        (safeMaxXP - safeMinXP + 1)
+      ) + safeMinXP;
 
-    let finalXP =
-      xpToGive;
+    let finalXP = xpToGive;
 
     if (
       levelingConfig.xpMultiplier &&
       levelingConfig.xpMultiplier > 1
     ) {
-
       finalXP =
         Math.floor(
           finalXP *
@@ -772,21 +688,16 @@ async function handleLeveling(
         finalXP
       );
 
-    if (
-      result?.leveledUp
-    ) {
-
+    if (result?.leveledUp) {
       logger.info(
         `${message.author.tag} leveled up to level ${result.level} in ${message.guild.name}`
       );
     }
 
   } catch (error) {
-
     logger.error(
       'Error handling leveling for message:',
       error
     );
-
   }
 }
